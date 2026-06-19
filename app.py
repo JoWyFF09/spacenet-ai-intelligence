@@ -313,6 +313,25 @@ if modo == "Pipeline de Auditoría":
     if archivo and st.button("Ejecutar Análisis"):
         with st.spinner("Procesando red neuronal..."):
             df = pd.read_csv(archivo) if archivo.name.endswith('.csv') else pd.read_excel(archivo)
+            empresa_actual = st.session_state["empresa"]
+
+            # Si entra la Agencia X, le renombramos sus columnas raras a las estándar que entiende tu IA
+            if empresa_actual == "Agencia_X":
+                df = df.rename(columns={
+                    "Presupuesto_Mensual": "Ingresos_Anuales",
+                    "Años": "Edad",
+                    "Correo": "Email",
+                    "Cliente_Nombre": "Nombre"
+                })
+
+            # Si entra E-commerce Y, hacemos lo mismo con las suyas
+            elif empresa_actual == "Ecommerce_Y":
+                df = df.rename(columns={
+                    "Facturacion": "Ingresos_Anuales",
+                    "Email_Contacto": "Email"
+                })
+
+# A partir de aquí, tu motor de IA siempre recibe 'Edad', 'Ingresos_Anuales', etc. ¡No tienes que tocar la IA!
             df_limpio, total, nulos, alertas, analisis = purificar_datos_con_ia(df)
             
             # GUARDADO MULTI-TENANT
@@ -399,21 +418,25 @@ elif modo == "Base de Datos SQL":
     
     # --- MURO DE PAGO (PAYWALL) ---
     if not df_sql.empty:
+        # 1. Identificamos si el que ha entrado eres tú (el jefe)
+        es_admin = (st.session_state.get("empresa") == "Spacenet_Admin")
+        
         if 'pro_unlocked' not in st.session_state:
             st.session_state.pro_unlocked = False
             
-        if not st.session_state.pro_unlocked:
+        # 2. Si NO eres el admin y NO has pagado -> Muro cerrado
+        if not es_admin and not st.session_state.pro_unlocked:
             st.warning("⚠️ Los datos purificados están bloqueados. Se requiere acceso de nivel Corporativo.")
             
-            # Botón para que te envíen un email (puedes usar mailto:)
+            # Botón de contacto
             st.link_button("💼 SOLICITAR ACCESO CORPORATIVO", "mailto:joelrodriguezcr10@gmail.com?subject=Consulta Acceso Spacenet AI")
             
-            # Opcional: Un botón para licencia individual a precio más alto
+            # Botón de compra rápida
             if st.button("Adquirir Licencia Individual (299€)"):
                 st.write("Redirigiendo a pasarela segura...")
                 st.link_button("COMPRAR AHORA", "https://buy.stripe.com/00w14gaRG1Dn6FT1L22Nq01")
             
-            # --- MURO DE PAGO (PAYWALL) ACTUALIZADO ---
+            # Verificación con Stripe
             with st.expander("🔑 ¿Ya tienes licencia? Verifica tu acceso"):
                 st.write("Introduce el email con el que realizaste la compra en Stripe:")
                 email_pago = st.text_input("Email de facturación")
@@ -423,13 +446,18 @@ elif modo == "Base de Datos SQL":
                         if verificar_suscripcion_activa(email_pago):
                             st.session_state.pro_unlocked = True
                             st.success("✅ Licencia validada. ¡Acceso concedido!")
-                            time.sleep(1) # Pequeña pausa para que el usuario lea el mensaje
+                            time.sleep(1) 
                             st.rerun()
                         else:
                             st.error("❌ No se ha encontrado una suscripción activa para este email. Si acabas de suscribirte, espera unos segundos.")
         
+        # 3. Si ERES el admin O SI has pagado -> Descarga libre
         else:
-            st.success("✅ Licencia PRO activada. Descarga habilitada.")
+            if es_admin:
+                st.success("👑 Modo Administrador: Muro de pago ignorado. Acceso total habilitado.")
+            else:
+                st.success("✅ Licencia PRO activada. Descarga habilitada.")
+                
             csv = df_sql.to_csv(index=False).encode('utf-8')
             st.download_button(
                 "⬇️ EXPORTAR DATASET PURIFICADO (CSV)", 
