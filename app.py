@@ -15,6 +15,7 @@ import io
 import smtplib
 from email.message import EmailMessage
 from datetime import datetime
+import streamlit.components.v1 as components
 import stripe
 
 # Ocultar el menú de Streamlit y el pie de página
@@ -52,6 +53,12 @@ PLANES = {
 # Precios one-shot del marketplace de datasets limpios (data flywheel)
 PRECIO_DATASET_PRO_EUR = 49
 PRECIO_DATASET_BUSINESS_EUR = 99
+PLANES_PRO_O_SUPERIOR = {"Pro", "Business"}
+MSG_PDF_REQUIERE_PRO = (
+    "Este módulo requiere suscripción Pro o superior activa. "
+    "Por favor renueva tu suscripción para continuar."
+)
+MSG_PDF_PREMIUM = "📄 PDF premium requiere suscripción activa"
 
 # ==========================================
 # AUTHENTICATION (MULTI-TENANT)
@@ -412,6 +419,68 @@ def crear_sesion_checkout(email, empresa, plan="Pro", trial=False):
 
     return stripe.checkout.Session.create(**params)
 
+def abrir_url_stripe(url, etiqueta="Ir a Stripe Checkout →"):
+    """Abre Checkout de Stripe (nueva pestaña) con botón de respaldo."""
+    st.session_state["stripe_checkout_url"] = url
+    try:
+        components.html(
+            f"""
+            <script>
+              window.open("{url}", "_blank");
+            </script>
+            """,
+            height=0,
+        )
+    except Exception:
+        pass
+    st.link_button(etiqueta, url, type="primary")
+    st.caption("Si no se abre sola, pulsa el botón para ir a Stripe Checkout.")
+
+def crear_sesion_checkout_venta_dataset(email, empresa, plan="Pro"):
+    """Checkout one-shot al pulsar «Vender Dataset Limpio» (49€ Pro / 99€ Business)."""
+    if plan not in PLANES_PRO_O_SUPERIOR:
+        plan = "Pro"
+    precio_eur = precio_dataset_segun_plan(plan)
+    cliente_id = obtener_o_crear_cliente_stripe(email, empresa)
+    base = obtener_url_base()
+
+    # Price ID opcional en secrets; si no, price_data dinámico
+    try:
+        price_id = st.secrets["STRIPE_PRICE_DATASET_BUSINESS" if plan == "Business" else "STRIPE_PRICE_DATASET"]
+        line_items = [{"price": price_id, "quantity": 1}]
+    except Exception:
+        line_items = [{
+            "price_data": {
+                "currency": "eur",
+                "unit_amount": int(precio_eur) * 100,
+                "product_data": {
+                    "name": f"Venta Dataset Limpio Spacenet AI ({plan})",
+                    "description": (
+                        f"Purificación + publicación marketplace · "
+                        f"{precio_eur}€ · tenant {empresa}"
+                    ),
+                },
+            },
+            "quantity": 1,
+        }]
+
+    return stripe.checkout.Session.create(
+        mode="payment",
+        customer=cliente_id,
+        line_items=line_items,
+        success_url=f"{base}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{base}/?checkout=cancel",
+        client_reference_id=empresa,
+        metadata={
+            "tipo": "venta_dataset",
+            "empresa": empresa,
+            "plan": plan,
+            "precio_eur": str(precio_eur),
+        },
+        locale="es",
+        allow_promotion_codes=True,
+    )
+
 def crear_sesion_checkout_dataset(email, empresa_comprador, empresa_vendedor, dataset_nombre, precio_eur):
     """Checkout one-shot para comprar un dataset limpio del marketplace."""
     cliente_id = obtener_o_crear_cliente_stripe(email, empresa_comprador)
@@ -483,13 +552,6 @@ def cancelar_suscripcion_stripe(email):
         canceladas.append(sub.id)
 
     return True, f"Suscripción cancelada correctamente ({len(canceladas)})."
-
-PLANES_PRO_O_SUPERIOR = {"Pro", "Business"}
-MSG_PDF_REQUIERE_PRO = (
-    "Este módulo requiere suscripción Pro o superior activa. "
-    "Por favor renueva tu suscripción para continuar."
-)
-MSG_PDF_PREMIUM = "📄 PDF premium requiere suscripción activa"
 
 def _inferir_plan_desde_suscripcion(sub):
     """Obtiene el plan desde metadata Stripe o importe (céntimos)."""
@@ -781,8 +843,97 @@ def descargar_dataset_vendido(empresa, dataset_nombre):
     finally:
         conn.close()
 
+def obtener_fuente_ultimo_dataset():
+    """Último CSV/XLSX procesado (para venta tras Checkout)."""
+    df_fuente = st.session_state.get("df_sucio_ultimo")
+    if df_fuente is None and st.session_state.get("analisis") is not None:
+        df_fuente = st.session_state.analisis.drop(columns=["Error_IA"], errors="ignore")
+    return df_fuente
+
+def ejecutar_venta_dataset_limpio():
+    """Purifica el último dataset, lo guarda con dataset_vendido=True y notifica."""
+    empresa_actual = st.session_state["empresa"]
+    df_fuente = obtener_fuente_ultimo_dataset()
+    if df_fuente is None:
+        return False, "No hay un dataset reciente. Ejecuta el Pipeline o sube un CSV primero."
+
+    plan = st.session_state.get("plan_activo") or "Pro"
+    if plan not in PLANES_PRO_O_SUPERIOR and not es_admin_tenant():
+        return False, MSG_PDF_REQUIERE_PRO
+
+    plan_precio = plan if plan in PLANES_PRO_O_SUPERIOR else "Pro"
+    precio = precio_dataset_segun_plan(plan_precio)
+    df_limpio, total, nulos, alertas, analisis = purificar_datos_con_ia(df_fuente.copy())
+    nombre_ds = f"marketplace_{empresa_actual}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    precio = guardar_dataset_vendido(
+        empresa_actual,
+        df_limpio,
+        nombre_ds,
+        plan=plan if plan in PLANES else "Pro",
+        precio_eur=precio,
+    )
+    st.session_state.df_procesado = df_limpio
+    st.session_state.analisis = analisis
+    st.session_state.metricas = (total, nulos, alertas)
+    st.session_state.ultimo_dataset_vendido = nombre_ds
+    try:
+        enviar_aviso_dataset(
+            f"📦 DATASET PUBLICADO: {nombre_ds} ({precio}€)",
+            (
+                f"Empresa vendedora: {empresa_actual}\n"
+                f"Dataset: {nombre_ds}\n"
+                f"Registros limpios: {len(df_limpio)}\n"
+                f"Anomalías bloqueadas: {alertas}\n"
+                f"Precio marketplace: {precio}€\n"
+                f"Plan: {plan}\n"
+            ),
+        )
+    except Exception:
+        pass
+    return True, (
+        f"Dataset «{nombre_ds}» purificado y publicado a {precio}€ "
+        f"({len(df_limpio):,} filas, {alertas:,} anomalías bloqueadas)."
+    )
+
+def iniciar_checkout_venta_dataset():
+    """
+    Crea la sesión Stripe Checkout (49€ / 99€) para «Vender Dataset Limpio».
+    Devuelve (ok, url|None, mensaje).
+    """
+    if not tiene_suscripcion_pro_o_superior():
+        return False, None, MSG_PDF_REQUIERE_PRO
+
+    email = obtener_email_facturacion()
+    if not email or "@" not in email:
+        return False, None, "Introduce tu email de facturación en el sidebar antes de vender."
+
+    if obtener_fuente_ultimo_dataset() is None:
+        return False, None, (
+            "No hay un dataset reciente para vender. "
+            "Ejecuta el Pipeline de Auditoría o sube un CSV en «Dataset para mi IA» primero."
+        )
+
+    empresa = st.session_state["empresa"]
+    plan = st.session_state.get("plan_activo") or "Pro"
+    if plan not in PLANES_PRO_O_SUPERIOR:
+        plan = "Pro"
+    precio = precio_dataset_segun_plan(plan)
+
+    try:
+        session = crear_sesion_checkout_venta_dataset(email, empresa, plan)
+    except Exception as e:
+        return False, None, f"Error al crear Stripe Checkout: {e}"
+
+    st.session_state.pendiente_venta_dataset = {
+        "empresa": empresa,
+        "plan": plan,
+        "precio_eur": precio,
+        "session_id": session.id,
+    }
+    return True, session.url, f"Abriendo Stripe Checkout · {precio}€"
+
 def procesar_pago_exitoso(session_id):
-    """Tras Checkout: suscripción (PDF) o compra de dataset del marketplace."""
+    """Tras Checkout: suscripción, venta de dataset o compra marketplace."""
     if st.session_state.get("checkout_procesado") == session_id:
         return
 
@@ -798,7 +949,29 @@ def procesar_pago_exitoso(session_id):
         email = customer.get("email")
     email = email or obtener_email_facturacion() or "cliente@desconocido.com"
 
-    # --- Compra one-shot de dataset limpio ---
+    # --- Venta: pago 49€/99€ → purificar + dataset_vendido=True + lista ---
+    if meta.get("tipo") == "venta_dataset":
+        empresa = meta.get("empresa") or session.get("client_reference_id") or st.session_state.get("empresa")
+        plan = meta.get("plan") or st.session_state.get("plan_activo") or "Pro"
+        precio_eur = meta.get("precio_eur") or str(precio_dataset_segun_plan(plan))
+        st.session_state.email_facturacion = email
+        if plan in PLANES:
+            st.session_state.plan_activo = plan
+            st.session_state.pro_unlocked = True
+        st.session_state.force_modo = "Dataset para mi IA"
+        st.session_state.mostrar_lista_tras_venta = True
+        st.session_state.checkout_procesado = session_id
+        ok, mensaje = ejecutar_venta_dataset_limpio()
+        if ok:
+            st.success(f"✅ Pago de {precio_eur}€ confirmado. {mensaje}")
+        else:
+            st.error(
+                f"Pago de {precio_eur}€ recibido, pero no se pudo guardar el dataset: {mensaje}"
+            )
+        st.session_state.pendiente_venta_dataset = None
+        return
+
+    # --- Compra one-shot de un dataset ya publicado ---
     if meta.get("tipo") == "dataset":
         empresa_comprador = meta.get("empresa") or session.get("client_reference_id") or st.session_state.get("empresa")
         empresa_vendedor = meta.get("empresa_vendedor") or ""
@@ -811,9 +984,10 @@ def procesar_pago_exitoso(session_id):
             "empresa": empresa_vendedor,
             "nombre": dataset_nombre,
         }
+        st.session_state.force_modo = "Dataset para mi IA"
         try:
             enviar_aviso_dataset(
-                f"🛒 DATASET VENDIDO: {dataset_nombre} ({precio_eur}€)",
+                f"🛒 DATASET COMPRADO: {dataset_nombre} ({precio_eur}€)",
                 (
                     f"Comprador: {empresa_comprador} ({email})\n"
                     f"Vendedor: {empresa_vendedor}\n"
@@ -1003,63 +1177,56 @@ st.sidebar.subheader("🔄 Data Flywheel")
 if st.sidebar.button("Crear dataset para mi IA", key="sidebar_crear_dataset"):
     st.session_state.force_modo = "Dataset para mi IA"
     st.session_state.accion_vender_dataset = False
+    st.session_state.checkout_venta_url = None
     st.rerun()
 
 if tiene_suscripcion_pro_o_superior():
-    if st.sidebar.button("Vender Dataset Limpio para mi IA", key="sidebar_vender_dataset"):
-        st.session_state.force_modo = "Dataset para mi IA"
-        st.session_state.accion_vender_dataset = True
-        st.rerun()
+    plan_sb = st.session_state.get("plan_activo") or "Pro"
+    precio_sb = precio_dataset_segun_plan(
+        plan_sb if plan_sb in PLANES_PRO_O_SUPERIOR else "Pro"
+    )
+    if st.sidebar.button(
+        f"Vender Dataset Limpio para mi IA ({precio_sb}€)",
+        key="sidebar_vender_dataset",
+    ):
+        ok, url, mensaje = iniciar_checkout_venta_dataset()
+        if ok and url:
+            st.session_state.checkout_venta_url = url
+            st.session_state.checkout_venta_abierto = False
+            st.session_state.force_modo = "Dataset para mi IA"
+            st.session_state.accion_vender_dataset = False
+            st.rerun()
+        else:
+            st.sidebar.error(mensaje)
 else:
     st.sidebar.caption("Venta de datasets: requiere Pro o superior.")
+
+if st.session_state.get("checkout_venta_url"):
+    st.sidebar.link_button(
+        "Abrir Stripe Checkout →",
+        st.session_state.checkout_venta_url,
+        type="primary",
+    )
+    st.sidebar.caption("Completa el pago para publicar el dataset limpio.")
 
 if st.session_state.get("force_modo"):
     modo = st.session_state.pop("force_modo")
 
 st.title("Spacenet Data Intelligence")
 
-def ejecutar_venta_dataset_limpio():
-    """Purifica el último dataset, lo publica en el marketplace y notifica."""
-    empresa_actual = st.session_state["empresa"]
-    df_fuente = st.session_state.get("df_sucio_ultimo")
-    if df_fuente is None and st.session_state.get("analisis") is not None:
-        # analisis conserva columnas originales + Error_IA
-        df_fuente = st.session_state.analisis.drop(columns=["Error_IA"], errors="ignore")
-    if df_fuente is None:
-        return False, "No hay un dataset reciente. Ejecuta el Pipeline o sube un CSV primero."
-
-    plan = st.session_state.get("plan_activo") or "Pro"
-    if plan not in PLANES_PRO_O_SUPERIOR and not es_admin_tenant():
-        return False, MSG_PDF_REQUIERE_PRO
-
-    precio = precio_dataset_segun_plan(plan if plan in PLANES_PRO_O_SUPERIOR else "Pro")
-    df_limpio, total, nulos, alertas, analisis = purificar_datos_con_ia(df_fuente.copy())
-    nombre_ds = f"marketplace_{empresa_actual}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
-    precio = guardar_dataset_vendido(
-        empresa_actual, df_limpio, nombre_ds, plan=plan if plan in PLANES else "Pro", precio_eur=precio
-    )
-    st.session_state.df_procesado = df_limpio
-    st.session_state.analisis = analisis
-    st.session_state.metricas = (total, nulos, alertas)
-    st.session_state.ultimo_dataset_vendido = nombre_ds
-    try:
-        enviar_aviso_dataset(
-            f"📦 DATASET PUBLICADO: {nombre_ds} ({precio}€)",
-            (
-                f"Empresa vendedora: {empresa_actual}\n"
-                f"Dataset: {nombre_ds}\n"
-                f"Registros limpios: {len(df_limpio)}\n"
-                f"Anomalías bloqueadas: {alertas}\n"
-                f"Precio marketplace: {precio}€\n"
-                f"Plan: {plan}\n"
-            ),
+# Si hay URL de Checkout pendiente (venta), abrir Stripe una sola vez
+if st.session_state.get("checkout_venta_url"):
+    url_venta = st.session_state.checkout_venta_url
+    st.info("💳 Checkout de venta de dataset listo. Completa el pago en Stripe.")
+    if not st.session_state.get("checkout_venta_abierto"):
+        st.session_state.checkout_venta_abierto = True
+        abrir_url_stripe(url_venta, etiqueta="Pagar y publicar dataset en Stripe →")
+    else:
+        st.link_button(
+            "Pagar y publicar dataset en Stripe →",
+            url_venta,
+            type="primary",
         )
-    except Exception:
-        pass
-    return True, (
-        f"Dataset «{nombre_ds}» purificado y publicado a {precio}€ "
-        f"({len(df_limpio):,} filas, {alertas:,} anomalías bloqueadas)."
-    )
 
 def render_marketplace_datasets(contexto="marketplace", solo_propios=False):
     """Lista datasets limpios con precio y Checkout Stripe para comprar."""
@@ -1133,10 +1300,9 @@ def render_marketplace_datasets(contexto="marketplace", solo_propios=False):
                                 nombre_ds,
                                 precio,
                             )
-                            st.link_button(
-                                "Ir a Stripe Checkout →",
+                            abrir_url_stripe(
                                 session.url,
-                                type="primary",
+                                etiqueta=f"Pagar {precio}€ en Stripe →",
                             )
                         except Exception as e:
                             st.error(f"Error al crear Checkout: {e}")
@@ -1408,19 +1574,10 @@ elif modo == "Dataset para mi IA":
         st.info("Este módulo requiere suscripción activa. Elige un plan para continuar.")
         render_checkout_planes(contexto="dataset")
     else:
-        # Auto-ejecutar venta si se pulsó el botón del sidebar
-        if st.session_state.get("accion_vender_dataset"):
-            st.session_state.accion_vender_dataset = False
-            if not tiene_suscripcion_pro_o_superior():
-                st.warning(MSG_PDF_REQUIERE_PRO)
-                render_checkout_planes(contexto="vender_gate")
-            else:
-                with st.spinner("Purificando y publicando dataset en el marketplace..."):
-                    ok, mensaje = ejecutar_venta_dataset_limpio()
-                if ok:
-                    st.success(mensaje)
-                else:
-                    st.error(mensaje)
+        if st.session_state.get("mostrar_lista_tras_venta"):
+            st.session_state.mostrar_lista_tras_venta = False
+            st.session_state.checkout_venta_url = None
+            st.session_state.checkout_venta_abierto = False
 
         st.markdown("#### Crear dataset para mi IA")
         archivo_ia = st.file_uploader(
@@ -1435,12 +1592,20 @@ elif modo == "Dataset para mi IA":
 
         col_a, col_b = st.columns(2)
         with col_a:
-            crear_clicked = st.button("Crear dataset para mi IA", type="primary", key="btn_crear_dataset_mod")
+            crear_clicked = st.button(
+                "Crear dataset para mi IA",
+                type="primary",
+                key="btn_crear_dataset_mod",
+            )
         with col_b:
             vender_clicked = False
             if tiene_suscripcion_pro_o_superior():
+                plan_mod = st.session_state.get("plan_activo") or "Pro"
+                precio_mod = precio_dataset_segun_plan(
+                    plan_mod if plan_mod in PLANES_PRO_O_SUPERIOR else "Pro"
+                )
                 vender_clicked = st.button(
-                    "Vender Dataset Limpio para mi IA",
+                    f"Vender Dataset Limpio para mi IA ({precio_mod}€)",
                     key="btn_vender_dataset_mod",
                 )
             else:
@@ -1463,32 +1628,21 @@ elif modo == "Dataset para mi IA":
                     st.session_state.df_sucio_ultimo = df.copy()
                     df_limpio, total, nulos, alertas, analisis = purificar_datos_con_ia(df)
                     try:
-                        plan = st.session_state.get("plan_activo") or "Pro"
-                        precio = precio_dataset_segun_plan(
-                            plan if plan in PLANES_PRO_O_SUPERIOR else "Pro"
-                        )
-                        guardar_dataset_vendido(
-                            empresa_actual,
-                            df_limpio,
-                            nombre_dataset.strip(),
-                            plan=plan if plan in PLANES else "Pro",
-                            precio_eur=precio,
-                        )
                         st.session_state.metricas = (total, nulos, alertas)
                         st.session_state.df_procesado = df_limpio
                         st.session_state.analisis = analisis
                         st.success(
-                            f"Dataset «{nombre_dataset.strip()}» purificado y guardado "
-                            f"({len(df_limpio):,} filas, {alertas:,} anomalías bloqueadas)."
+                            f"Dataset «{nombre_dataset.strip()}» purificado "
+                            f"({len(df_limpio):,} filas, {alertas:,} anomalías bloqueadas). "
+                            "Usa «Vender Dataset Limpio» para publicarlo vía Stripe Checkout."
                         )
                     except Exception as e:
-                        st.error(f"Error al guardar el dataset: {e}")
+                        st.error(f"Error al procesar el dataset: {e}")
 
         if vender_clicked:
             if not tiene_suscripcion_pro_o_superior():
                 st.warning(MSG_PDF_REQUIERE_PRO)
             else:
-                # Si hay archivo nuevo, usarlo como fuente; si no, el último en sesión
                 if archivo_ia:
                     df = (
                         pd.read_csv(archivo_ia)
@@ -1497,10 +1651,13 @@ elif modo == "Dataset para mi IA":
                     )
                     df = adaptar_columnas_tenant(df, st.session_state["empresa"])
                     st.session_state.df_sucio_ultimo = df.copy()
-                with st.spinner("Purificando y publicando en marketplace..."):
-                    ok, mensaje = ejecutar_venta_dataset_limpio()
-                if ok:
+                with st.spinner("Creando Stripe Checkout..."):
+                    ok, url, mensaje = iniciar_checkout_venta_dataset()
+                if ok and url:
+                    st.session_state.checkout_venta_url = url
+                    st.session_state.checkout_venta_abierto = True
                     st.success(mensaje)
+                    abrir_url_stripe(url, etiqueta="Pagar y publicar dataset en Stripe →")
                 else:
                     st.error(mensaje)
 
