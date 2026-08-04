@@ -412,25 +412,86 @@ def cancelar_suscripcion_stripe(email):
 
     return True, f"Suscripción cancelada correctamente ({len(canceladas)})."
 
+PLANES_PRO_O_SUPERIOR = {"Pro", "Business"}
+MSG_PDF_REQUIERE_PRO = (
+    "Este módulo requiere suscripción Pro o superior activa. "
+    "Por favor renueva tu suscripción para continuar."
+)
+MSG_PDF_PREMIUM = "📄 PDF premium requiere suscripción activa"
+
+def _inferir_plan_desde_suscripcion(sub):
+    """Obtiene el plan desde metadata Stripe o importe (céntimos)."""
+    meta = sub.get("metadata") or {}
+    plan = meta.get("plan")
+    if plan in PLANES:
+        return plan
+    try:
+        items = sub.get("items", {}).get("data") or []
+        if items:
+            amount = items[0].get("price", {}).get("unit_amount")
+            for nombre, info in PLANES.items():
+                if info["precio_centimos"] == amount:
+                    return nombre
+            product_name = (items[0].get("price", {}).get("product") or "")
+            # Si product es id, no ayuda; a veces viene expandido con name vía nickname
+            nickname = items[0].get("price", {}).get("nickname") or ""
+            for nombre in PLANES:
+                if nombre.lower() in str(nickname).lower():
+                    return nombre
+    except Exception:
+        pass
+    return None
+
+def obtener_suscripciones_vivas(email):
+    """Devuelve suscripciones active/trialing del email (multi-tenant vía metadata empresa)."""
+    if not email:
+        return []
+    clientes = stripe.Customer.list(email=email.strip(), limit=1)
+    if not clientes.data:
+        return []
+    cliente_id = clientes.data[0].id
+    activas = stripe.Subscription.list(customer=cliente_id, status="active", limit=10)
+    trials = stripe.Subscription.list(customer=cliente_id, status="trialing", limit=10)
+    return list(activas.data) + list(trials.data)
+
 def verificar_suscripcion_activa(email):
     """Busca en Stripe si el email tiene una suscripción mensual activa o en trial."""
     if not email:
         return False
-
     try:
-        clientes = stripe.Customer.list(email=email.strip(), limit=1)
-        if not clientes.data:
-            return False
-
-        cliente_id = clientes.data[0].id
-        activas = stripe.Subscription.list(customer=cliente_id, status="active", limit=5)
-        if len(activas.data) > 0:
-            return True
-        trials = stripe.Subscription.list(customer=cliente_id, status="trialing", limit=5)
-        return len(trials.data) > 0
+        return len(obtener_suscripciones_vivas(email)) > 0
     except Exception as e:
         st.error(f"Error de conexión con la pasarela de pagos: {e}")
         return False
+
+def sincronizar_plan_desde_stripe(email):
+    """Actualiza plan_activo en sesión a partir de Stripe. Devuelve el plan o None."""
+    try:
+        subs = obtener_suscripciones_vivas(email)
+    except Exception:
+        return None
+    for sub in subs:
+        plan = _inferir_plan_desde_suscripcion(sub)
+        if plan:
+            st.session_state.plan_activo = plan
+            st.session_state.pro_unlocked = True
+            return plan
+    if subs:
+        st.session_state.pro_unlocked = True
+        return st.session_state.get("plan_activo")
+    return None
+
+def es_admin_tenant():
+    return st.session_state.get("empresa") == "Spacenet_Admin"
+
+def tiene_suscripcion_pro_o_superior():
+    """True si es admin o tiene plan Pro/Business activo (PDF premium)."""
+    if es_admin_tenant():
+        return True
+    if not st.session_state.get("pro_unlocked"):
+        return False
+    plan = st.session_state.get("plan_activo")
+    return plan in PLANES_PRO_O_SUPERIOR
 
 def obtener_metricas_para_pdf(empresa):
     """Usa métricas de sesión si existen; si no, estima desde la DB del tenant."""
@@ -653,22 +714,36 @@ def procesar_pago_exitoso(session_id):
     st.session_state.email_facturacion = email
     st.session_state.plan_activo = plan
 
-    total, nulos, alertas = obtener_metricas_para_pdf(empresa)
-    pdf_bytes = generar_reporte_pdf(total, nulos, alertas, empresa)
-    st.session_state.pdf_generado = pdf_bytes
+    # PDF premium solo con Pro o Business
+    if plan in PLANES_PRO_O_SUPERIOR:
+        total, nulos, alertas = obtener_metricas_para_pdf(empresa)
+        pdf_bytes = generar_reporte_pdf(total, nulos, alertas, empresa)
+        st.session_state.pdf_generado = pdf_bytes
 
-    try:
-        guardar_pdf_en_db(empresa, pdf_bytes, plan)
-    except Exception as e:
-        st.error(f"Pago OK, pero no se pudo guardar el PDF en la base de datos: {e}")
+        try:
+            guardar_pdf_en_db(empresa, pdf_bytes, plan)
+        except Exception as e:
+            st.error(f"Pago OK, pero no se pudo guardar el PDF en la base de datos: {e}")
 
-    try:
-        enviar_aviso_pago(nombre, email, empresa, plan, trial=trial)
-    except Exception:
-        pass
+        try:
+            enviar_aviso_pago(nombre, email, empresa, plan, trial=trial)
+        except Exception:
+            pass
 
-    st.session_state.checkout_procesado = session_id
-    st.success(f"✅ Suscripción {plan} activada. PDF premium generado y guardado.")
+        st.session_state.checkout_procesado = session_id
+        st.success(f"✅ Suscripción {plan} activada. PDF premium generado y guardado.")
+    else:
+        st.session_state.pdf_generado = None
+        try:
+            enviar_aviso_pago(nombre, email, empresa, plan, trial=trial)
+        except Exception:
+            pass
+        st.session_state.checkout_procesado = session_id
+        st.success(f"✅ Suscripción {plan} activada.")
+        st.info(
+            "📄 PDF premium requiere suscripción activa (Pro o Business). "
+            "Actualiza tu plan para generar y descargar el informe."
+        )
 
 # ==========================================
 # DASHBOARD B2B (MULTI-TENANT)
@@ -728,6 +803,7 @@ if st.sidebar.button("Cancelar suscripción"):
         if ok:
             st.session_state.pro_unlocked = False
             st.session_state.plan_activo = None
+            st.session_state.pdf_generado = None
             st.sidebar.success(mensaje)
         else:
             st.sidebar.error(mensaje)
@@ -845,10 +921,15 @@ def render_checkout_planes(contexto="paywall"):
         )
         if st.button("Verificar Suscripción", key=f"btn_verificar_{contexto}"):
             with st.spinner("Conectando con Stripe..."):
-                if verificar_suscripcion_activa(email_pago):
+                plan = sincronizar_plan_desde_stripe(email_pago)
+                if plan or verificar_suscripcion_activa(email_pago):
                     st.session_state.pro_unlocked = True
                     st.session_state.email_facturacion = email_pago.strip()
-                    st.success("✅ Licencia validada. ¡Acceso concedido!")
+                    if plan:
+                        st.session_state.plan_activo = plan
+                    st.success(
+                        f"✅ Licencia validada ({st.session_state.get('plan_activo') or 'activa'}). ¡Acceso concedido!"
+                    )
                     time.sleep(1)
                     st.rerun()
                 else:
@@ -931,32 +1012,49 @@ if modo == "Pipeline de Auditoría":
         with tab2:
             st.dataframe(analisis[analisis['Error_IA'] > 0.05], width='stretch')
 
-        with st.expander("📥 Obtener Informe de Auditoría Completo"):
-            st.write("Introduce tus datos para generar y descargar el informe oficial.")
-            with st.form("form_captacion"):
-                nombre_cliente = st.text_input("Nombre de la Empresa / Contacto")
-                email_cliente = st.text_input("Email Corporativo")
-                submit_button = st.form_submit_button("Generar PDF")
+        with st.expander("📥 Obtener Informe de Auditoría Completo", expanded=True):
+            st.info(MSG_PDF_PREMIUM)
 
-                if submit_button:
-                    if email_cliente and "@" in email_cliente:
-                        empresa_actual = st.session_state["empresa"]
-                        st.session_state.pdf_generado = generar_reporte_pdf(total, nulos, alertas, empresa_actual)
-                        try:
-                            enviar_aviso_venta(nombre_cliente, email_cliente, empresa_actual)
-                        except Exception:
-                            pass
-                        st.success(f"Informe listo para {nombre_cliente}. ¡Ya puedes descargarlo!")
-                    else:
-                        st.error("Por favor, introduce un email corporativo válido.")
+            if not tiene_suscripcion_pro_o_superior():
+                # Bloquea generación y cualquier PDF residual en sesión
+                st.session_state.pdf_generado = None
+                st.warning(MSG_PDF_REQUIERE_PRO)
+                render_checkout_planes(contexto="pdf")
+            else:
+                st.write("Introduce tus datos para generar y descargar el informe oficial.")
+                with st.form("form_captacion"):
+                    nombre_cliente = st.text_input("Nombre de la Empresa / Contacto")
+                    email_cliente = st.text_input("Email Corporativo")
+                    st.caption(MSG_PDF_PREMIUM)
+                    submit_button = st.form_submit_button("Generar PDF")
 
-        if st.session_state.pdf_generado:
-            st.download_button(
-                label="⬇️ DESCARGAR PDF AHORA",
-                data=st.session_state.pdf_generado,
-                file_name=f"Informe_Auditoria_{st.session_state['empresa']}.pdf",
-                mime="application/pdf",
-            )
+                    if submit_button:
+                        if not tiene_suscripcion_pro_o_superior():
+                            st.session_state.pdf_generado = None
+                            st.warning(MSG_PDF_REQUIERE_PRO)
+                        elif email_cliente and "@" in email_cliente:
+                            empresa_actual = st.session_state["empresa"]
+                            st.session_state.pdf_generado = generar_reporte_pdf(
+                                total, nulos, alertas, empresa_actual
+                            )
+                            try:
+                                enviar_aviso_venta(nombre_cliente, email_cliente, empresa_actual)
+                            except Exception:
+                                pass
+                            st.success(f"Informe listo para {nombre_cliente}. ¡Ya puedes descargarlo!")
+                        else:
+                            st.error("Por favor, introduce un email corporativo válido.")
+
+                if st.session_state.pdf_generado and tiene_suscripcion_pro_o_superior():
+                    st.download_button(
+                        label="⬇️ DESCARGAR PDF AHORA",
+                        data=st.session_state.pdf_generado,
+                        file_name=f"Informe_Auditoria_{st.session_state['empresa']}.pdf",
+                        mime="application/pdf",
+                        key="dl_pdf_pipeline",
+                    )
+                elif st.session_state.pdf_generado:
+                    st.session_state.pdf_generado = None
 
 elif modo == "Base de Datos SQL":
     st.subheader(f"Registros Aislados: {st.session_state['empresa']}")
@@ -1002,7 +1100,8 @@ elif modo == "Base de Datos SQL":
                 mime="text/csv",
             )
 
-            if st.session_state.pdf_generado:
+            if st.session_state.pdf_generado and tiene_suscripcion_pro_o_superior():
+                st.info(MSG_PDF_PREMIUM)
                 st.download_button(
                     label="⬇️ DESCARGAR PDF PREMIUM",
                     data=st.session_state.pdf_generado,
@@ -1010,6 +1109,9 @@ elif modo == "Base de Datos SQL":
                     mime="application/pdf",
                     key="dl_pdf_sql",
                 )
+            elif st.session_state.pdf_generado and not tiene_suscripcion_pro_o_superior():
+                st.session_state.pdf_generado = None
+                st.warning(MSG_PDF_REQUIERE_PRO)
 
 elif modo == "Dataset para mi IA":
     st.subheader("Crear dataset para mi IA")
